@@ -5,9 +5,16 @@ color/normal/depth/albedoの補助バッファとともに保存する。
 
 補助バッファ（normal/depth/albedo）はジッター無しのprimary rayから計算され、
 SPPやseedに関わらず同一シーンなら一致する。
+
+ノイズ源:
+1. Area Light: 面光源を円盤サンプルしてソフトシャドウを生成
+2. Specular Jitter: スペキュラ反射方向を微小にブレさせる
+3. DOF (被写界深度): レンズアパーチャでボケを表現
+4. 背景ノイズ: 低周波value noiseベース
 """
 
 import argparse
+import json
 import os
 import sys
 
@@ -40,18 +47,29 @@ struct Sphere {
 layout(std430, binding=1) buffer Spheres { Sphere spheres[]; };
 
 uniform int sphereCount;
-uniform vec4 light;           // xyz: 方向, w: 強さ
 uniform uint frameSeed;       // フレームごとのシード
 uniform int spp;              // サンプル数
-uniform float shadowSoftness; // ソフトシャドウの柔らかさ
 uniform float depthFar;       // depth正規化用の最大距離
+
+// Area Light パラメータ
+uniform vec3 lightCenter;     // 光源中心位置
+uniform float lightRadius;    // 光源半径（面光源サイズ）
+uniform float lightIntensity; // 光源強度
+
+// Specular パラメータ
 uniform float shininess;      // スペキュラの鋭さ
+uniform float specJitterScale; // スペキュラジッターの強さ
+
+// DOF パラメータ
+uniform float apertureRadius; // レンズ開口半径（0で無効）
+uniform float focusDistance;  // 焦点距離
 
 // 背景パラメータ
-uniform int bgType;        // 0:gradient, 1:checker, 2:noise
+uniform int bgType;           // 0:gradient, 1:checker, 2:noise
 uniform vec3 bgColor1;
 uniform vec3 bgColor2;
 uniform float bgPhase;
+uniform float bgNoiseScale;   // 背景ノイズ強度
 
 const int MAX_SPHERES = 16;
 const int MAX_DEPTH = 3;
@@ -59,6 +77,7 @@ const int MAX_STACK = 16;
 const float HIT_THRESHOLD = 1.0e-4;
 const float MAX_DISTANCE = 100.0;
 const int MAX_MARCH_STEPS = 100;
+const float PI = 3.14159265359;
 
 // =============================================================================
 // Wang Hash RNG
@@ -79,6 +98,31 @@ float rand(inout uint state) {
 
 uint initRNG(ivec2 pixel, int sampleIndex) {
     return wang_hash(uint(pixel.x) + wang_hash(uint(pixel.y) + wang_hash(frameSeed + uint(sampleIndex))));
+}
+
+// 円盤上の一様サンプル
+vec2 sampleDisk(inout uint rng) {
+    float r = sqrt(rand(rng));
+    float theta = 2.0 * PI * rand(rng);
+    return vec2(r * cos(theta), r * sin(theta));
+}
+
+// =============================================================================
+// Value Noise（低周波ノイズ）
+// =============================================================================
+float hash(vec2 p) {
+    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+}
+
+float valueNoise(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f); // smoothstep
+    float a = hash(i);
+    float b = hash(i + vec2(1.0, 0.0));
+    float c = hash(i + vec2(0.0, 1.0));
+    float d = hash(i + vec2(1.0, 1.0));
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
 }
 
 // =============================================================================
@@ -142,26 +186,44 @@ vec3 calcNormal(vec3 p) {
 }
 
 // =============================================================================
-// ソフトシャドウ
+// Area Light ソフトシャドウ
 // =============================================================================
-float calcSoftShadow(vec3 p, vec3 lightDir, inout uint rng) {
-    // 光源方向のジッター
+float calcAreaLightShadow(vec3 hitPos, inout uint rng) {
+    // 円盤上の光源サンプル
+    vec2 diskSample = sampleDisk(rng) * lightRadius;
+
+    // 光源座標系を構築
+    vec3 lightDir = normalize(lightCenter - hitPos);
     vec3 tangent = normalize(cross(lightDir, vec3(0.0, 1.0, 0.001)));
     vec3 bitangent = cross(lightDir, tangent);
-    vec3 jitter = tangent * (rand(rng) - 0.5) * shadowSoftness
-                + bitangent * (rand(rng) - 0.5) * shadowSoftness;
-    vec3 jitteredDir = normalize(lightDir + jitter);
 
-    vec3 pos = p + jitteredDir * 0.01;
+    // サンプル位置
+    vec3 lightPos = lightCenter + tangent * diskSample.x + bitangent * diskSample.y;
+    vec3 toLight = normalize(lightPos - hitPos);
+
+    // シャドウレイ
+    vec3 pos = hitPos + toLight * 0.01;
+    float maxDist = length(lightPos - hitPos);
     float distance = 0.0;
+
     for (int i = 0; i < 50; i++) {
         float d = distanceAt(pos);
-        if (d < HIT_THRESHOLD) return 0.2;
-        if (distance > MAX_DISTANCE) break;
+        if (d < HIT_THRESHOLD) return 0.15; // 影の中
+        if (distance > maxDist) break;
         distance += d;
-        pos += jitteredDir * d;
+        pos += toLight * d;
     }
     return 1.0;
+}
+
+// シェーディング用の光源方向を取得（ジッター付き）
+vec3 getAreaLightDir(vec3 hitPos, inout uint rng) {
+    vec2 diskSample = sampleDisk(rng) * lightRadius;
+    vec3 lightDir = normalize(lightCenter - hitPos);
+    vec3 tangent = normalize(cross(lightDir, vec3(0.0, 1.0, 0.001)));
+    vec3 bitangent = cross(lightDir, tangent);
+    vec3 lightPos = lightCenter + tangent * diskSample.x + bitangent * diskSample.y;
+    return normalize(lightPos - hitPos);
 }
 
 // =============================================================================
@@ -186,23 +248,19 @@ bool hitGround(vec3 origin, vec3 ray, out float t, out vec3 groundColor) {
 // =============================================================================
 vec3 proceduralBgDeterministic(vec3 ray) {
     if (bgType == 0) {
-        // グラデーション
         float t = ray.y * 0.5 + 0.5 + sin(bgPhase) * 0.1;
         return mix(bgColor1, bgColor2, clamp(t, 0.0, 1.0));
     } else if (bgType == 1) {
-        // 球面チェッカー
-        float u = atan(ray.z, ray.x) / 3.14159265 * 4.0 + bgPhase;
-        float v = asin(ray.y) / 1.5707963 * 4.0;
+        float u = atan(ray.z, ray.x) / PI * 4.0 + bgPhase;
+        float v = asin(ray.y) / (PI * 0.5) * 4.0;
         int cu = int(floor(u));
         int cv = int(floor(v));
-        if (((cu + cv) & 1) == 0) {
-            return bgColor1;
-        } else {
-            return bgColor2;
-        }
+        return (((cu + cv) & 1) == 0) ? bgColor1 : bgColor2;
     } else {
-        // ノイズ風（決定論的: ピクセル座標ベースのハッシュを使用せず、単純にグラデーション）
-        float t = ray.y * 0.5 + 0.5;
+        // Value noiseベースの背景（決定論的成分のみ）
+        vec2 uv = vec2(atan(ray.z, ray.x) / PI, ray.y);
+        float noise = valueNoise(uv * 8.0 + bgPhase);
+        float t = ray.y * 0.5 + 0.5 + (noise - 0.5) * bgNoiseScale;
         return mix(bgColor1, bgColor2, clamp(t, 0.0, 1.0));
     }
 }
@@ -213,36 +271,29 @@ vec3 proceduralBgDeterministic(vec3 ray) {
 vec3 proceduralBgNoisy(vec3 ray, ivec2 pixel, inout uint rng) {
     if (bgType == 0) {
         // グラデーション + 微小ノイズ
-        float noise = (rand(rng) - 0.5) * 0.05;
-        float t = ray.y * 0.5 + 0.5 + sin(bgPhase) * 0.1 + noise;
+        float sampleNoise = (rand(rng) - 0.5) * bgNoiseScale * 0.3;
+        float t = ray.y * 0.5 + 0.5 + sin(bgPhase) * 0.1 + sampleNoise;
         return mix(bgColor1, bgColor2, clamp(t, 0.0, 1.0));
     } else if (bgType == 1) {
-        // 球面チェッカー + エッジノイズ
-        float u = atan(ray.z, ray.x) / 3.14159265 * 4.0 + bgPhase;
-        float v = asin(ray.y) / 1.5707963 * 4.0;
-        // エッジ付近でノイズを加える
+        // 球面チェッカー + エッジアンチエイリアス風ノイズ
+        float u = atan(ray.z, ray.x) / PI * 4.0 + bgPhase;
+        float v = asin(ray.y) / (PI * 0.5) * 4.0;
         float fu = fract(u);
         float fv = fract(v);
         float edgeDist = min(min(fu, 1.0-fu), min(fv, 1.0-fv));
         float noise = 0.0;
-        if (edgeDist < 0.1) {
-            noise = (rand(rng) - 0.5) * 0.3 * (1.0 - edgeDist / 0.1);
+        if (edgeDist < 0.15) {
+            noise = (rand(rng) - 0.5) * bgNoiseScale * (1.0 - edgeDist / 0.15);
         }
-        int cu = int(floor(u + noise));
+        int cu = int(floor(u + noise * 0.5));
         int cv = int(floor(v));
-        if (((cu + cv) & 1) == 0) {
-            return bgColor1;
-        } else {
-            return bgColor2;
-        }
+        return (((cu + cv) & 1) == 0) ? bgColor1 : bgColor2;
     } else {
-        // ノイズ風（低周波ノイズ: ピクセル座標とbgPhaseからハッシュノイズ）
-        uint noiseState = wang_hash(uint(pixel.x * 17 + pixel.y * 31) + uint(bgPhase * 1000.0) + frameSeed);
-        float noise1 = float(wang_hash(noiseState)) / 4294967296.0;
-        float noise2 = float(wang_hash(noiseState + 1u)) / 4294967296.0;
-        // サンプルごとに微変化するノイズ
-        float sampleNoise = rand(rng) * 0.1;
-        float t = ray.y * 0.5 + 0.5 + (noise1 - 0.5) * 0.15 + sampleNoise;
+        // Value noise + サンプルノイズ
+        vec2 uv = vec2(atan(ray.z, ray.x) / PI, ray.y);
+        float baseNoise = valueNoise(uv * 8.0 + bgPhase);
+        float sampleNoise = rand(rng) * bgNoiseScale * 0.2;
+        float t = ray.y * 0.5 + 0.5 + (baseNoise - 0.5) * bgNoiseScale + sampleNoise;
         return mix(bgColor1, bgColor2, clamp(t, 0.0, 1.0));
     }
 }
@@ -251,14 +302,14 @@ vec3 proceduralBgNoisy(vec3 ray, ivec2 pixel, inout uint rng) {
 // Primary Ray Hit判定（ジッターなし、補助バッファ用）
 // =============================================================================
 struct PrimaryHitResult {
-    vec3 normal;      // [-1,1] -> [0,1] にマッピング済み
-    float depth;      // 正規化済み [0,1]
-    vec3 albedo;      // ベース色
+    vec3 normal;
+    float depth;
+    vec3 albedo;
 };
 
 PrimaryHitResult tracePrimaryRay(vec3 camOrigin, vec3 ray) {
     PrimaryHitResult result;
-    result.normal = vec3(0.5, 0.5, 1.0);  // デフォルト: 背景向き
+    result.normal = vec3(0.5, 0.5, 1.0);
     result.depth = 1.0;
     result.albedo = vec3(0.0);
 
@@ -266,7 +317,6 @@ PrimaryHitResult tracePrimaryRay(vec3 camOrigin, vec3 ray) {
     float distance = 0.0;
     int count = min(sphereCount, MAX_SPHERES);
 
-    // メタボールとのレイマーチング
     for (int i = 0; i < MAX_MARCH_STEPS; i++) {
         if (distance > MAX_DISTANCE) break;
         if (count == 0) break;
@@ -279,20 +329,14 @@ PrimaryHitResult tracePrimaryRay(vec3 camOrigin, vec3 ray) {
         float minDist = -log(weightSum) / max(kMax, 1.0e-6);
 
         if (minDist < HIT_THRESHOLD) {
-            // メタボールにヒット
             vec3 hitPos = pos;
             vec3 normal = calcNormal(hitPos);
-
-            // アルベド（混色）
             vec3 albedo = vec3(0.0);
             for (int j = 0; j < count; j++) {
                 albedo += spheres[j].color * weights[j];
             }
             albedo /= weightSum;
-
-            // depth: カメラからヒット点までの距離
             float depthDistance = length(hitPos - camOrigin);
-
             result.normal = normal * 0.5 + 0.5;
             result.depth = clamp(depthDistance / depthFar, 0.0, 1.0);
             result.albedo = albedo;
@@ -303,20 +347,17 @@ PrimaryHitResult tracePrimaryRay(vec3 camOrigin, vec3 ray) {
         pos += ray * minDist;
     }
 
-    // 地面との交差判定
     float t;
     vec3 groundColor;
     if (hitGround(camOrigin, ray, t, groundColor)) {
         vec3 hitPos = camOrigin + ray * t;
         float depthDistance = length(hitPos - camOrigin);
-
-        result.normal = vec3(0.5, 1.0, 0.5);  // 地面法線 (0,1,0) -> (0.5, 1.0, 0.5)
+        result.normal = vec3(0.5, 1.0, 0.5);
         result.depth = clamp(depthDistance / depthFar, 0.0, 1.0);
         result.albedo = groundColor;
         return result;
     }
 
-    // 背景
     result.albedo = proceduralBgDeterministic(ray);
     return result;
 }
@@ -350,7 +391,6 @@ vec3 traceColorSample(vec3 camOrigin, vec3 initialRay, ivec2 pixel, inout uint r
         float distance = 0.0;
         bool hit = false;
 
-        // レイマーチング
         for (int i = 0; i < MAX_MARCH_STEPS; i++) {
             if (distance > MAX_DISTANCE) break;
             if (count == 0) break;
@@ -363,7 +403,6 @@ vec3 traceColorSample(vec3 camOrigin, vec3 initialRay, ivec2 pixel, inout uint r
             float minDist = -log(weightSum) / max(kMax, 1.0e-6);
 
             if (minDist < HIT_THRESHOLD) {
-                // マテリアル情報を集約
                 vec4 ratios = vec4(0.0);
                 vec3 color = vec3(0.0);
                 float ior = 0.0;
@@ -380,35 +419,39 @@ vec3 traceColorSample(vec3 camOrigin, vec3 initialRay, ivec2 pixel, inout uint r
                 vec3 normal = calcNormal(pos);
                 if (task.inside) normal = -normal;
 
-                vec3 lightDir = -light.xyz;
-
-                // ソフトシャドウ
-                float shadow = calcSoftShadow(pos, lightDir, rng);
+                // Area Light シャドウ
+                float shadow = calcAreaLightShadow(pos, rng);
+                vec3 lightDir = getAreaLightDir(pos, rng);
 
                 // 環境光
-                sampleColor += task.weight * ratios.x * color * light.w;
+                sampleColor += task.weight * ratios.x * color * lightIntensity;
 
                 // 拡散光
                 float diff = max(dot(normal, lightDir), 0.0);
-                sampleColor += task.weight * ratios.y * color * diff * light.w * shadow;
+                sampleColor += task.weight * ratios.y * color * diff * lightIntensity * shadow;
 
-                // スペキュラハイライト（ノイズ源追加）
+                // スペキュラハイライト（ジッター強化）
                 vec3 viewDir = -ray;
                 vec3 reflectLightDir = reflect(-lightDir, normal);
-                // スペキュラ方向に微小ジッター
                 vec3 specTangent = normalize(cross(reflectLightDir, vec3(0.0, 1.0, 0.001)));
                 vec3 specBitangent = cross(reflectLightDir, specTangent);
-                vec3 specJitter = specTangent * (rand(rng) - 0.5) * 0.1
-                                + specBitangent * (rand(rng) - 0.5) * 0.1;
+                vec3 specJitter = specTangent * (rand(rng) - 0.5) * specJitterScale
+                                + specBitangent * (rand(rng) - 0.5) * specJitterScale;
                 vec3 jitteredReflect = normalize(reflectLightDir + specJitter);
                 float spec = pow(max(dot(jitteredReflect, viewDir), 0.0), shininess);
-                // スペキュラはアルベドに軽く依存
                 vec3 specColor = mix(vec3(1.0), color, 0.3);
-                sampleColor += task.weight * ratios.y * specColor * spec * light.w * shadow * 0.5;
+                sampleColor += task.weight * ratios.y * specColor * spec * lightIntensity * shadow * 0.6;
 
                 // 反射
                 if (ratios.z > 0.01 && stackPtr < MAX_STACK) {
                     vec3 reflectDir = reflect(ray, normal);
+                    // 反射方向にも微小ジッター
+                    vec3 refTangent = normalize(cross(reflectDir, vec3(0.0, 1.0, 0.001)));
+                    vec3 refBitangent = cross(reflectDir, refTangent);
+                    vec3 refJitter = refTangent * (rand(rng) - 0.5) * specJitterScale * 0.5
+                                   + refBitangent * (rand(rng) - 0.5) * specJitterScale * 0.5;
+                    reflectDir = normalize(reflectDir + refJitter);
+
                     stack[stackPtr].origin = pos + normal * 0.01;
                     stack[stackPtr].direction = reflectDir;
                     stack[stackPtr].weight = task.weight * ratios.z;
@@ -439,15 +482,14 @@ vec3 traceColorSample(vec3 camOrigin, vec3 initialRay, ivec2 pixel, inout uint r
             pos += ray * minDist;
         }
 
-        // ヒットしなかった場合
         if (!hit) {
             float t;
             vec3 groundColor;
             if (hitGround(task.origin, ray, t, groundColor)) {
                 vec3 groundPos = task.origin + ray * t;
                 vec3 groundNormal = vec3(0.0, 1.0, 0.0);
-                vec3 lightDir = -light.xyz;
-                float shadow = calcSoftShadow(groundPos, lightDir, rng);
+                float shadow = calcAreaLightShadow(groundPos, rng);
+                vec3 lightDir = getAreaLightDir(groundPos, rng);
                 float diff = max(dot(groundNormal, lightDir), 0.0);
                 sampleColor += task.weight * groundColor * (0.3 + 0.7 * diff * shadow);
             } else {
@@ -497,22 +539,41 @@ void main() {
         vec2 uv = (vec2(pixel) + 0.5 + jitter) / vec2(size) - 0.5;
         vec3 sampleRay = normalize(uv.x * right - uv.y * up + screen_depth * forward);
 
-        accumulatedColor += traceColorSample(camOrigin, sampleRay, pixel, rng);
+        // DOF: レンズアパーチャサンプリング
+        vec3 sampleOrigin = camOrigin;
+        if (apertureRadius > 0.0) {
+            // 焦点面上の点を計算
+            vec3 focalPoint = camOrigin + sampleRay * focusDistance;
+            // レンズ上のランダム位置
+            vec2 lensSample = sampleDisk(rng) * apertureRadius;
+            sampleOrigin = camOrigin + right * lensSample.x + up * lensSample.y;
+            // 新しいレイ方向
+            sampleRay = normalize(focalPoint - sampleOrigin);
+        }
+
+        accumulatedColor += traceColorSample(sampleOrigin, sampleRay, pixel, rng);
     }
 
-    // 平均化
     vec3 finalColor = accumulatedColor / float(spp);
     finalColor = clamp(finalColor, 0.0, 1.0);
 
-    // ========================================================================
-    // 出力
-    // ========================================================================
     imageStore(img_color, pixel, vec4(finalColor, 1.0));
     imageStore(img_normal, pixel, vec4(primary.normal, 1.0));
     imageStore(img_depth, pixel, vec4(vec3(primary.depth), 1.0));
     imageStore(img_albedo, pixel, vec4(primary.albedo, 1.0));
 }
 """
+
+
+# =============================================================================
+# 材質プリセット
+# =============================================================================
+MATERIAL_PRESETS = {
+    'diffuse': {'ratios': [0.1, 0.85, 0.05, 0.0], 'weight': 0.4},
+    'glossy': {'ratios': [0.1, 0.5, 0.4, 0.0], 'weight': 0.3},
+    'metallic': {'ratios': [0.05, 0.2, 0.75, 0.0], 'weight': 0.15},
+    'glassy': {'ratios': [0.05, 0.15, 0.15, 0.65], 'weight': 0.15},
+}
 
 
 def create_texture_rgba16f(width: int, height: int) -> int:
@@ -533,29 +594,35 @@ def read_texture_float32(tex: int, width: int, height: int) -> np.ndarray:
     return np.frombuffer(data, dtype=np.float32).reshape(height, width, 4).copy()
 
 
+def select_material_preset(rng: np.random.Generator) -> np.ndarray:
+    """材質プリセットからランダムに選択"""
+    names = list(MATERIAL_PRESETS.keys())
+    weights = [MATERIAL_PRESETS[n]['weight'] for n in names]
+    weights = np.array(weights) / sum(weights)
+    name = rng.choice(names, p=weights)
+    base_ratios = np.array(MATERIAL_PRESETS[name]['ratios'])
+    # 少しだけランダムに乱す
+    noise = rng.uniform(-0.05, 0.05, size=4)
+    ratios = np.clip(base_ratios + noise, 0.01, 1.0)
+    ratios = ratios / ratios.sum()
+    return ratios
+
+
 def generate_random_spheres(rng: np.random.Generator, n: int = None) -> np.ndarray:
     """ランダムな球データを生成"""
     if n is None:
-        n = rng.integers(2, 7)
-    # MAX_SPHERESを超えないようにclamp
+        n = rng.integers(3, 8)
     n = min(n, 16)
 
     spheres = []
     for _ in range(n):
-        # 位置: x[-0.3, 0.3], y[-0.1, 0.2], z[-1.2, -0.6]
         x = rng.uniform(-0.3, 0.3)
-        y = rng.uniform(-0.1, 0.2)
+        y = rng.uniform(-0.05, 0.2)
         z = rng.uniform(-1.2, -0.6)
-        # 半径: [0.03, 0.15]
-        r = rng.uniform(0.03, 0.15)
-        # 色: [0.2, 1.0]
-        color = rng.uniform(0.2, 1.0, size=3)
-        # 屈折率
-        ior = rng.uniform(1.3, 1.7)
-        # ratios: ランダム後正規化
-        ratios = rng.uniform(0.0, 1.0, size=4)
-        ratios[0] = rng.uniform(0.05, 0.2)  # 環境光は小さめ
-        ratios = ratios / ratios.sum()
+        r = rng.uniform(0.04, 0.14)
+        color = rng.uniform(0.3, 1.0, size=3)
+        ior = rng.uniform(1.3, 1.6)
+        ratios = select_material_preset(rng)
 
         spheres.append([
             (x, y, z, r),
@@ -566,20 +633,25 @@ def generate_random_spheres(rng: np.random.Generator, n: int = None) -> np.ndarr
     return np.array(spheres, dtype=np.float32)
 
 
-def generate_random_light(rng: np.random.Generator) -> tuple:
-    """ランダムな光源方向を生成（上半球）"""
-    # 球面座標でランダム
+def generate_random_light(rng: np.random.Generator) -> dict:
+    """ランダムな面光源パラメータを生成"""
     theta = rng.uniform(0, 2 * np.pi)
-    phi = rng.uniform(0.1, np.pi / 2)  # 上半球
-    x = np.sin(phi) * np.cos(theta)
-    y = -np.cos(phi)  # 下向き成分（光が上から）
-    z = np.sin(phi) * np.sin(theta)
-    # 正規化
-    direction = np.array([x, y, z])
-    direction = direction / np.linalg.norm(direction)
-    # 強度
-    intensity = rng.uniform(0.8, 1.2)
-    return direction, intensity
+    phi = rng.uniform(0.2, np.pi / 3)
+    distance = rng.uniform(1.5, 3.0)
+
+    x = distance * np.sin(phi) * np.cos(theta)
+    y = distance * np.cos(phi)
+    z = distance * np.sin(phi) * np.sin(theta) - 1.0
+
+    center = np.array([x, y, z])
+    radius = rng.uniform(0.1, 0.4)
+    intensity = rng.uniform(0.9, 1.3)
+
+    return {
+        'center': center,
+        'radius': radius,
+        'intensity': intensity
+    }
 
 
 def generate_random_background(rng: np.random.Generator) -> dict:
@@ -588,11 +660,13 @@ def generate_random_background(rng: np.random.Generator) -> dict:
     color1 = rng.uniform(0.3, 1.0, size=3)
     color2 = rng.uniform(0.3, 1.0, size=3)
     phase = rng.uniform(0, 2 * np.pi)
+    noise_scale = rng.uniform(0.1, 0.4)
     return {
         'type': bg_type,
         'color1': color1,
         'color2': color2,
-        'phase': phase
+        'phase': phase,
+        'noise_scale': noise_scale
     }
 
 
@@ -601,19 +675,19 @@ def render_scene(
     textures: dict,
     spheres: np.ndarray,
     ssbo: int,
-    light_dir: np.ndarray,
-    light_intensity: float,
+    light_params: dict,
     bg_params: dict,
     width: int,
     height: int,
     spp: int,
     frame_seed: int,
-    shadow_softness: float = 0.15,
     depth_far: float = 5.0,
-    shininess: float = 64.0
+    shininess: float = 48.0,
+    spec_jitter_scale: float = 0.15,
+    aperture_radius: float = 0.0,
+    focus_distance: float = 1.0
 ):
     """シーンをレンダリング"""
-    # SSBOにデータをアップロード
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo)
     glBufferData(GL_SHADER_STORAGE_BUFFER, spheres.nbytes, spheres, GL_STATIC_DRAW)
 
@@ -621,55 +695,109 @@ def render_scene(
 
     # Uniform設定
     glUniform1i(glGetUniformLocation(program, "sphereCount"), min(spheres.shape[0], 16))
-    glUniform4f(
-        glGetUniformLocation(program, "light"),
-        light_dir[0], light_dir[1], light_dir[2], light_intensity
-    )
     glUniform1ui(glGetUniformLocation(program, "frameSeed"), frame_seed)
     glUniform1i(glGetUniformLocation(program, "spp"), spp)
-    glUniform1f(glGetUniformLocation(program, "shadowSoftness"), shadow_softness)
     glUniform1f(glGetUniformLocation(program, "depthFar"), depth_far)
+
+    # Area Light
+    glUniform3f(glGetUniformLocation(program, "lightCenter"), *light_params['center'])
+    glUniform1f(glGetUniformLocation(program, "lightRadius"), light_params['radius'])
+    glUniform1f(glGetUniformLocation(program, "lightIntensity"), light_params['intensity'])
+
+    # Specular
     glUniform1f(glGetUniformLocation(program, "shininess"), shininess)
+    glUniform1f(glGetUniformLocation(program, "specJitterScale"), spec_jitter_scale)
 
-    # 背景パラメータ
+    # DOF
+    glUniform1f(glGetUniformLocation(program, "apertureRadius"), aperture_radius)
+    glUniform1f(glGetUniformLocation(program, "focusDistance"), focus_distance)
+
+    # 背景
     glUniform1i(glGetUniformLocation(program, "bgType"), bg_params['type'])
-    glUniform3f(
-        glGetUniformLocation(program, "bgColor1"),
-        *bg_params['color1']
-    )
-    glUniform3f(
-        glGetUniformLocation(program, "bgColor2"),
-        *bg_params['color2']
-    )
+    glUniform3f(glGetUniformLocation(program, "bgColor1"), *bg_params['color1'])
+    glUniform3f(glGetUniformLocation(program, "bgColor2"), *bg_params['color2'])
     glUniform1f(glGetUniformLocation(program, "bgPhase"), bg_params['phase'])
+    glUniform1f(glGetUniformLocation(program, "bgNoiseScale"), bg_params['noise_scale'])
 
-    # テクスチャをバインド（WRITE_ONLY）
+    # テクスチャをバインド
     glBindImageTexture(0, textures['color'], 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F)
     glBindImageTexture(1, textures['normal'], 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F)
     glBindImageTexture(2, textures['depth'], 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F)
     glBindImageTexture(3, textures['albedo'], 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F)
 
-    # 実行
     glDispatchCompute((width + 15) // 16, (height + 15) // 16, 1)
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
 
 
 def save_preview_png(data: np.ndarray, path: str, apply_gamma: bool = True):
-    """float32データをPNGプレビューとして保存
-
-    Args:
-        data: [0,1] linear float32 データ
-        path: 出力パス
-        apply_gamma: Trueならgamma補正(1/2.2)を適用
-    """
+    """float32データをPNGプレビューとして保存"""
     img = np.clip(data[:, :, :3], 0, 1)
     if apply_gamma:
-        # gamma補正: linear -> sRGB
         img = np.power(img, 1.0 / 2.2)
     img = (img * 255).astype(np.uint8)
-    # RGB -> BGR
     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
     cv2.imwrite(path, img)
+
+
+def save_metadata(scene_dir: str, spheres: np.ndarray, light_params: dict,
+                  bg_params: dict, frame_seed: int, render_params: dict):
+    """シーンのメタデータをJSONで保存"""
+    metadata = {
+        'spheres': [],
+        'light': {
+            'center': light_params['center'].tolist(),
+            'radius': float(light_params['radius']),
+            'intensity': float(light_params['intensity'])
+        },
+        'background': {
+            'type': int(bg_params['type']),
+            'color1': bg_params['color1'].tolist(),
+            'color2': bg_params['color2'].tolist(),
+            'phase': float(bg_params['phase']),
+            'noise_scale': float(bg_params['noise_scale'])
+        },
+        'frame_seed': int(frame_seed),
+        'render_params': render_params
+    }
+
+    for i in range(spheres.shape[0]):
+        sphere_data = {
+            'position': spheres[i, 0, :3].tolist(),
+            'radius': float(spheres[i, 0, 3]),
+            'color': spheres[i, 1, :3].tolist(),
+            'ior': float(spheres[i, 1, 3]),
+            'ratios': spheres[i, 2, :4].tolist()
+        }
+        metadata['spheres'].append(sphere_data)
+
+    with open(os.path.join(scene_dir, 'metadata.json'), 'w') as f:
+        json.dump(metadata, f, indent=2)
+
+
+def validate_auxiliary_buffers(textures: dict, program: int, spheres: np.ndarray,
+                               ssbo: int, light_params: dict, bg_params: dict,
+                               width: int, height: int, frame_seed: int,
+                               render_params: dict) -> dict:
+    """補助バッファがSPPに依存しないことを検証"""
+    # SPP=1でレンダリング
+    render_scene(program, textures, spheres, ssbo, light_params, bg_params,
+                 width, height, 1, frame_seed, **render_params)
+    normal_spp1 = read_texture_float32(textures['normal'], width, height)
+    depth_spp1 = read_texture_float32(textures['depth'], width, height)
+    albedo_spp1 = read_texture_float32(textures['albedo'], width, height)
+
+    # SPP=64でレンダリング
+    render_scene(program, textures, spheres, ssbo, light_params, bg_params,
+                 width, height, 64, frame_seed, **render_params)
+    normal_spp64 = read_texture_float32(textures['normal'], width, height)
+    depth_spp64 = read_texture_float32(textures['depth'], width, height)
+    albedo_spp64 = read_texture_float32(textures['albedo'], width, height)
+
+    return {
+        'normal_max_diff': float(np.abs(normal_spp1 - normal_spp64).max()),
+        'depth_max_diff': float(np.abs(depth_spp1 - depth_spp64).max()),
+        'albedo_max_diff': float(np.abs(albedo_spp1 - albedo_spp64).max()),
+    }
 
 
 def main():
@@ -678,21 +806,20 @@ def main():
     parser.add_argument('--n', type=int, default=1000, help='生成するシーン数')
     parser.add_argument('--width', type=int, default=256, help='画像幅')
     parser.add_argument('--height', type=int, default=256, help='画像高さ')
-    parser.add_argument('--low_spp', type=int, nargs='+', default=[1, 2, 4, 8], help='低SPPリスト')
+    parser.add_argument('--low_spp', type=int, nargs='+', default=[1, 2, 4, 8, 16], help='低SPPリスト')
     parser.add_argument('--high_spp', type=int, default=256, help='高SPP（Ground Truth）')
     parser.add_argument('--seed', type=int, default=42, help='乱数シード')
-    parser.add_argument('--shadow_softness', type=float, default=0.15, help='ソフトシャドウの柔らかさ')
     parser.add_argument('--depth_far', type=float, default=5.0, help='depth正規化の最大距離')
-    parser.add_argument('--shininess', type=float, default=64.0, help='スペキュラの鋭さ')
+    parser.add_argument('--shininess', type=float, default=48.0, help='スペキュラの鋭さ')
+    parser.add_argument('--spec_jitter', type=float, default=0.15, help='スペキュラジッター強度')
+    parser.add_argument('--aperture', type=float, default=0.0, help='DOFアパーチャ半径（0で無効）')
+    parser.add_argument('--focus_dist', type=float, default=1.0, help='DOF焦点距離')
+    parser.add_argument('--validate', action='store_true', help='補助バッファの一貫性を検証')
     args = parser.parse_args()
 
-    # 出力ディレクトリ作成
     os.makedirs(args.out_dir, exist_ok=True)
-
-    # 乱数生成器
     rng = np.random.default_rng(args.seed)
 
-    # GLFW初期化
     if not glfw.init():
         print("GLFWの初期化に失敗しました")
         sys.exit(1)
@@ -710,17 +837,13 @@ def main():
 
     glfw.make_context_current(window)
 
-    # シェーダーコンパイル
     try:
-        program = compileProgram(
-            compileShader(COMPUTE_SHADER, GL_COMPUTE_SHADER),
-        )
+        program = compileProgram(compileShader(COMPUTE_SHADER, GL_COMPUTE_SHADER))
     except RuntimeError as e:
         print(f"シェーダーコンパイルエラー:\n{e}")
         glfw.terminate()
         sys.exit(1)
 
-    # テクスチャ作成
     textures = {
         'color': create_texture_rgba16f(args.width, args.height),
         'normal': create_texture_rgba16f(args.width, args.height),
@@ -728,70 +851,87 @@ def main():
         'albedo': create_texture_rgba16f(args.width, args.height),
     }
 
-    # SSBO作成
     ssbo = glGenBuffers(1)
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo)
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, ssbo)
 
+    render_params = {
+        'depth_far': args.depth_far,
+        'shininess': args.shininess,
+        'spec_jitter_scale': args.spec_jitter,
+        'aperture_radius': args.aperture,
+        'focus_distance': args.focus_dist
+    }
+
     print(f"データセット生成開始: {args.n}シーン, {args.width}x{args.height}")
     print(f"低SPP: {args.low_spp}, 高SPP: {args.high_spp}")
+    if args.validate:
+        print("補助バッファ検証モード有効")
+
+    validation_results = []
 
     for scene_idx in range(args.n):
         scene_dir = os.path.join(args.out_dir, f"{scene_idx:06d}")
         os.makedirs(scene_dir, exist_ok=True)
 
-        # シーンパラメータ生成
         spheres = generate_random_spheres(rng)
-        light_dir, light_intensity = generate_random_light(rng)
+        light_params = generate_random_light(rng)
         bg_params = generate_random_background(rng)
-
-        # フレームシードはシーンごとに固定（同一シーンで異なるSPPを比較可能に）
         frame_seed = rng.integers(0, 2**31)
 
-        # 高SPPレンダリング（Ground Truth）
-        render_scene(
-            program, textures, spheres, ssbo,
-            light_dir, light_intensity, bg_params,
-            args.width, args.height,
-            args.high_spp, frame_seed,
-            args.shadow_softness, args.depth_far, args.shininess
-        )
+        # 検証モード
+        if args.validate:
+            result = validate_auxiliary_buffers(
+                textures, program, spheres, ssbo, light_params, bg_params,
+                args.width, args.height, frame_seed, render_params
+            )
+            validation_results.append(result)
 
-        # 読み出し・保存
+        # 高SPPレンダリング
+        render_scene(program, textures, spheres, ssbo, light_params, bg_params,
+                     args.width, args.height, args.high_spp, frame_seed, **render_params)
+
         color_high = read_texture_float32(textures['color'], args.width, args.height)
         normal = read_texture_float32(textures['normal'], args.width, args.height)
         depth = read_texture_float32(textures['depth'], args.width, args.height)
         albedo = read_texture_float32(textures['albedo'], args.width, args.height)
 
-        # NPYはlinearのまま保存
         np.save(os.path.join(scene_dir, "color_high.npy"), color_high)
         np.save(os.path.join(scene_dir, "normal.npy"), normal)
         np.save(os.path.join(scene_dir, "depth.npy"), depth)
         np.save(os.path.join(scene_dir, "albedo.npy"), albedo)
+        save_preview_png(color_high, os.path.join(scene_dir, "preview_high.png"))
 
-        # PNGはgamma補正して保存（見やすさのため）
-        save_preview_png(color_high, os.path.join(scene_dir, "preview_high.png"), apply_gamma=True)
+        # メタデータ保存
+        save_metadata(scene_dir, spheres, light_params, bg_params, frame_seed, render_params)
 
         # 低SPPレンダリング
         for low_spp in args.low_spp:
-            render_scene(
-                program, textures, spheres, ssbo,
-                light_dir, light_intensity, bg_params,
-                args.width, args.height,
-                low_spp, frame_seed,
-                args.shadow_softness, args.depth_far, args.shininess
-            )
-
+            render_scene(program, textures, spheres, ssbo, light_params, bg_params,
+                         args.width, args.height, low_spp, frame_seed, **render_params)
             color_low = read_texture_float32(textures['color'], args.width, args.height)
             np.save(os.path.join(scene_dir, f"color_low_spp{low_spp}.npy"), color_low)
-            save_preview_png(color_low, os.path.join(scene_dir, f"preview_low_spp{low_spp}.png"), apply_gamma=True)
+            save_preview_png(color_low, os.path.join(scene_dir, f"preview_low_spp{low_spp}.png"))
 
         if (scene_idx + 1) % 10 == 0 or scene_idx == 0:
             print(f"進捗: {scene_idx + 1}/{args.n} シーン完了")
 
+    # 検証結果出力
+    if args.validate and validation_results:
+        print("\n=== 補助バッファ一貫性検証結果 ===")
+        max_normal = max(r['normal_max_diff'] for r in validation_results)
+        max_depth = max(r['depth_max_diff'] for r in validation_results)
+        max_albedo = max(r['albedo_max_diff'] for r in validation_results)
+        print(f"normal max_abs_diff: {max_normal:.10f}")
+        print(f"depth  max_abs_diff: {max_depth:.10f}")
+        print(f"albedo max_abs_diff: {max_albedo:.10f}")
+        if max_normal <= 1e-6 and max_depth <= 1e-6 and max_albedo <= 1e-6:
+            print("✓ 補助バッファはSPPに依存しません")
+        else:
+            print("! 補助バッファに差分があります")
+
     print(f"データセット生成完了: {args.out_dir}")
 
-    # クリーンアップ
     glDeleteTextures(4, list(textures.values()))
     glDeleteBuffers(1, [ssbo])
     glDeleteProgram(program)

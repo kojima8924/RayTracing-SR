@@ -2,6 +2,9 @@
 デノイジング/超解像学習用データセット生成器
 メタボールレイマーチングによるシーンを複数SPPでレンダリングし、
 color/normal/depth/albedoの補助バッファとともに保存する。
+
+補助バッファ（normal/depth/albedo）はジッター無しのprimary rayから計算され、
+SPPやseedに関わらず同一シーンなら一致する。
 """
 
 import argparse
@@ -22,11 +25,11 @@ COMPUTE_SHADER = """
 precision highp float;
 layout(local_size_x = 16, local_size_y = 16) in;
 
-// 出力バッファ（4つ）
-layout(rgba16f, binding = 0) uniform image2D img_color;
-layout(rgba16f, binding = 1) uniform image2D img_normal;
-layout(rgba16f, binding = 2) uniform image2D img_depth;
-layout(rgba16f, binding = 3) uniform image2D img_albedo;
+// 出力バッファ（4つ）- WRITE_ONLYでbind
+layout(rgba16f, binding = 0) uniform writeonly image2D img_color;
+layout(rgba16f, binding = 1) uniform writeonly image2D img_normal;
+layout(rgba16f, binding = 2) uniform writeonly image2D img_depth;
+layout(rgba16f, binding = 3) uniform writeonly image2D img_albedo;
 
 struct Sphere {
     vec4 posRadius; // xyz: 位置, w: 半径
@@ -37,10 +40,12 @@ struct Sphere {
 layout(std430, binding=1) buffer Spheres { Sphere spheres[]; };
 
 uniform int sphereCount;
-uniform vec4 light;        // xyz: 方向, w: 強さ
-uniform uint frameSeed;    // フレームごとのシード
-uniform int spp;           // サンプル数
+uniform vec4 light;           // xyz: 方向, w: 強さ
+uniform uint frameSeed;       // フレームごとのシード
+uniform int spp;              // サンプル数
 uniform float shadowSoftness; // ソフトシャドウの柔らかさ
+uniform float depthFar;       // depth正規化用の最大距離
+uniform float shininess;      // スペキュラの鋭さ
 
 // 背景パラメータ
 uniform int bgType;        // 0:gradient, 1:checker, 2:noise
@@ -94,7 +99,8 @@ void fieldAt(vec3 p, out float kMax, out float weightSum, out float weights[MAX_
     float k_ref = 8.0;
     kMax = 0.0;
     weightSum = 0.0;
-    for (int j = 0; j < sphereCount; j++) {
+    int count = min(sphereCount, MAX_SPHERES);
+    for (int j = 0; j < count; j++) {
         Sphere sphere = spheres[j];
         float r = max(sphere.posRadius.w, 1.0e-3);
         float kj = k_ref / r;
@@ -110,7 +116,8 @@ float distanceAt(vec3 p) {
     float k_ref = 8.0;
     float kMax = 0.0;
     float weightSum = 0.0;
-    for (int j = 0; j < sphereCount; j++) {
+    int count = min(sphereCount, MAX_SPHERES);
+    for (int j = 0; j < count; j++) {
         Sphere sphere = spheres[j];
         float r = max(sphere.posRadius.w, 1.0e-3);
         float kj = k_ref / r;
@@ -175,9 +182,9 @@ bool hitGround(vec3 origin, vec3 ray, out float t, out vec3 groundColor) {
 }
 
 // =============================================================================
-// Procedural背景
+// Procedural背景（決定論的版 - primary用）
 // =============================================================================
-vec3 proceduralBg(vec3 ray, inout uint rng) {
+vec3 proceduralBgDeterministic(vec3 ray) {
     if (bgType == 0) {
         // グラデーション
         float t = ray.y * 0.5 + 0.5 + sin(bgPhase) * 0.1;
@@ -194,11 +201,262 @@ vec3 proceduralBg(vec3 ray, inout uint rng) {
             return bgColor2;
         }
     } else {
-        // ノイズ風
-        float noise = rand(rng) * 0.1;
+        // ノイズ風（決定論的: ピクセル座標ベースのハッシュを使用せず、単純にグラデーション）
         float t = ray.y * 0.5 + 0.5;
-        return mix(bgColor1, bgColor2, clamp(t + noise, 0.0, 1.0));
+        return mix(bgColor1, bgColor2, clamp(t, 0.0, 1.0));
     }
+}
+
+// =============================================================================
+// Procedural背景（ノイズ付き版 - color用）
+// =============================================================================
+vec3 proceduralBgNoisy(vec3 ray, ivec2 pixel, inout uint rng) {
+    if (bgType == 0) {
+        // グラデーション + 微小ノイズ
+        float noise = (rand(rng) - 0.5) * 0.05;
+        float t = ray.y * 0.5 + 0.5 + sin(bgPhase) * 0.1 + noise;
+        return mix(bgColor1, bgColor2, clamp(t, 0.0, 1.0));
+    } else if (bgType == 1) {
+        // 球面チェッカー + エッジノイズ
+        float u = atan(ray.z, ray.x) / 3.14159265 * 4.0 + bgPhase;
+        float v = asin(ray.y) / 1.5707963 * 4.0;
+        // エッジ付近でノイズを加える
+        float fu = fract(u);
+        float fv = fract(v);
+        float edgeDist = min(min(fu, 1.0-fu), min(fv, 1.0-fv));
+        float noise = 0.0;
+        if (edgeDist < 0.1) {
+            noise = (rand(rng) - 0.5) * 0.3 * (1.0 - edgeDist / 0.1);
+        }
+        int cu = int(floor(u + noise));
+        int cv = int(floor(v));
+        if (((cu + cv) & 1) == 0) {
+            return bgColor1;
+        } else {
+            return bgColor2;
+        }
+    } else {
+        // ノイズ風（低周波ノイズ: ピクセル座標とbgPhaseからハッシュノイズ）
+        uint noiseState = wang_hash(uint(pixel.x * 17 + pixel.y * 31) + uint(bgPhase * 1000.0) + frameSeed);
+        float noise1 = float(wang_hash(noiseState)) / 4294967296.0;
+        float noise2 = float(wang_hash(noiseState + 1u)) / 4294967296.0;
+        // サンプルごとに微変化するノイズ
+        float sampleNoise = rand(rng) * 0.1;
+        float t = ray.y * 0.5 + 0.5 + (noise1 - 0.5) * 0.15 + sampleNoise;
+        return mix(bgColor1, bgColor2, clamp(t, 0.0, 1.0));
+    }
+}
+
+// =============================================================================
+// Primary Ray Hit判定（ジッターなし、補助バッファ用）
+// =============================================================================
+struct PrimaryHitResult {
+    vec3 normal;      // [-1,1] -> [0,1] にマッピング済み
+    float depth;      // 正規化済み [0,1]
+    vec3 albedo;      // ベース色
+};
+
+PrimaryHitResult tracePrimaryRay(vec3 camOrigin, vec3 ray) {
+    PrimaryHitResult result;
+    result.normal = vec3(0.5, 0.5, 1.0);  // デフォルト: 背景向き
+    result.depth = 1.0;
+    result.albedo = vec3(0.0);
+
+    vec3 pos = camOrigin;
+    float distance = 0.0;
+    int count = min(sphereCount, MAX_SPHERES);
+
+    // メタボールとのレイマーチング
+    for (int i = 0; i < MAX_MARCH_STEPS; i++) {
+        if (distance > MAX_DISTANCE) break;
+        if (count == 0) break;
+
+        float kMax;
+        float weightSum;
+        float weights[MAX_SPHERES];
+        fieldAt(pos, kMax, weightSum, weights);
+        weightSum = max(weightSum, 1.0e-6);
+        float minDist = -log(weightSum) / max(kMax, 1.0e-6);
+
+        if (minDist < HIT_THRESHOLD) {
+            // メタボールにヒット
+            vec3 hitPos = pos;
+            vec3 normal = calcNormal(hitPos);
+
+            // アルベド（混色）
+            vec3 albedo = vec3(0.0);
+            for (int j = 0; j < count; j++) {
+                albedo += spheres[j].color * weights[j];
+            }
+            albedo /= weightSum;
+
+            // depth: カメラからヒット点までの距離
+            float depthDistance = length(hitPos - camOrigin);
+
+            result.normal = normal * 0.5 + 0.5;
+            result.depth = clamp(depthDistance / depthFar, 0.0, 1.0);
+            result.albedo = albedo;
+            return result;
+        }
+
+        distance += minDist;
+        pos += ray * minDist;
+    }
+
+    // 地面との交差判定
+    float t;
+    vec3 groundColor;
+    if (hitGround(camOrigin, ray, t, groundColor)) {
+        vec3 hitPos = camOrigin + ray * t;
+        float depthDistance = length(hitPos - camOrigin);
+
+        result.normal = vec3(0.5, 1.0, 0.5);  // 地面法線 (0,1,0) -> (0.5, 1.0, 0.5)
+        result.depth = clamp(depthDistance / depthFar, 0.0, 1.0);
+        result.albedo = groundColor;
+        return result;
+    }
+
+    // 背景
+    result.albedo = proceduralBgDeterministic(ray);
+    return result;
+}
+
+// =============================================================================
+// Color トレース（SPPループ内、ジッター付き）
+// =============================================================================
+vec3 traceColorSample(vec3 camOrigin, vec3 initialRay, ivec2 pixel, inout uint rng) {
+    RayTask stack[MAX_STACK];
+    int stackPtr = 0;
+    vec3 sampleColor = vec3(0.0);
+
+    stack[stackPtr].origin = camOrigin;
+    stack[stackPtr].direction = initialRay;
+    stack[stackPtr].weight = 1.0;
+    stack[stackPtr].depth = 0;
+    stack[stackPtr].inside = false;
+    stackPtr++;
+
+    int count = min(sphereCount, MAX_SPHERES);
+
+    while (stackPtr > 0) {
+        stackPtr--;
+        RayTask task = stack[stackPtr];
+
+        if (task.depth > MAX_DEPTH) continue;
+        if (task.weight < 0.01) continue;
+
+        vec3 pos = task.origin;
+        vec3 ray = task.direction;
+        float distance = 0.0;
+        bool hit = false;
+
+        // レイマーチング
+        for (int i = 0; i < MAX_MARCH_STEPS; i++) {
+            if (distance > MAX_DISTANCE) break;
+            if (count == 0) break;
+
+            float kMax;
+            float weightSum;
+            float weights[MAX_SPHERES];
+            fieldAt(pos, kMax, weightSum, weights);
+            weightSum = max(weightSum, 1.0e-6);
+            float minDist = -log(weightSum) / max(kMax, 1.0e-6);
+
+            if (minDist < HIT_THRESHOLD) {
+                // マテリアル情報を集約
+                vec4 ratios = vec4(0.0);
+                vec3 color = vec3(0.0);
+                float ior = 0.0;
+                for (int j = 0; j < count; j++) {
+                    Sphere sphere = spheres[j];
+                    ratios += sphere.ratios * weights[j];
+                    color += sphere.color * weights[j];
+                    ior += sphere.ior * weights[j];
+                }
+                ratios /= weightSum;
+                color /= weightSum;
+                ior /= weightSum;
+
+                vec3 normal = calcNormal(pos);
+                if (task.inside) normal = -normal;
+
+                vec3 lightDir = -light.xyz;
+
+                // ソフトシャドウ
+                float shadow = calcSoftShadow(pos, lightDir, rng);
+
+                // 環境光
+                sampleColor += task.weight * ratios.x * color * light.w;
+
+                // 拡散光
+                float diff = max(dot(normal, lightDir), 0.0);
+                sampleColor += task.weight * ratios.y * color * diff * light.w * shadow;
+
+                // スペキュラハイライト（ノイズ源追加）
+                vec3 viewDir = -ray;
+                vec3 reflectLightDir = reflect(-lightDir, normal);
+                // スペキュラ方向に微小ジッター
+                vec3 specTangent = normalize(cross(reflectLightDir, vec3(0.0, 1.0, 0.001)));
+                vec3 specBitangent = cross(reflectLightDir, specTangent);
+                vec3 specJitter = specTangent * (rand(rng) - 0.5) * 0.1
+                                + specBitangent * (rand(rng) - 0.5) * 0.1;
+                vec3 jitteredReflect = normalize(reflectLightDir + specJitter);
+                float spec = pow(max(dot(jitteredReflect, viewDir), 0.0), shininess);
+                // スペキュラはアルベドに軽く依存
+                vec3 specColor = mix(vec3(1.0), color, 0.3);
+                sampleColor += task.weight * ratios.y * specColor * spec * light.w * shadow * 0.5;
+
+                // 反射
+                if (ratios.z > 0.01 && stackPtr < MAX_STACK) {
+                    vec3 reflectDir = reflect(ray, normal);
+                    stack[stackPtr].origin = pos + normal * 0.01;
+                    stack[stackPtr].direction = reflectDir;
+                    stack[stackPtr].weight = task.weight * ratios.z;
+                    stack[stackPtr].depth = task.depth + 1;
+                    stack[stackPtr].inside = false;
+                    stackPtr++;
+                }
+
+                // 屈折
+                if (ratios.w > 0.01 && stackPtr < MAX_STACK) {
+                    float eta = task.inside ? ior : (1.0 / ior);
+                    vec3 refractDir = refract(ray, normal, eta);
+                    if (length(refractDir) > 0.0) {
+                        stack[stackPtr].origin = pos - normal * 0.01;
+                        stack[stackPtr].direction = refractDir;
+                        stack[stackPtr].weight = task.weight * ratios.w;
+                        stack[stackPtr].depth = task.depth + 1;
+                        stack[stackPtr].inside = !task.inside;
+                        stackPtr++;
+                    }
+                }
+
+                hit = true;
+                break;
+            }
+
+            distance += minDist;
+            pos += ray * minDist;
+        }
+
+        // ヒットしなかった場合
+        if (!hit) {
+            float t;
+            vec3 groundColor;
+            if (hitGround(task.origin, ray, t, groundColor)) {
+                vec3 groundPos = task.origin + ray * t;
+                vec3 groundNormal = vec3(0.0, 1.0, 0.0);
+                vec3 lightDir = -light.xyz;
+                float shadow = calcSoftShadow(groundPos, lightDir, rng);
+                float diff = max(dot(groundNormal, lightDir), 0.0);
+                sampleColor += task.weight * groundColor * (0.3 + 0.7 * diff * shadow);
+            } else {
+                sampleColor += task.weight * proceduralBgNoisy(ray, pixel, rng);
+            }
+        }
+    }
+
+    return sampleColor;
 }
 
 // =============================================================================
@@ -206,7 +464,7 @@ vec3 proceduralBg(vec3 ray, inout uint rng) {
 // =============================================================================
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 size = imageSize(img_color);
+    ivec2 size = ivec2(imageSize(img_color));
 
     if (pixel.x >= size.x || pixel.y >= size.y) return;
 
@@ -219,13 +477,16 @@ void main() {
     vec3 right = normalize(cross(forward, upHint));
     vec3 up = normalize(cross(right, forward));
 
-    // 補助バッファ用（プライマリヒット情報）
-    vec3 primaryNormal = vec3(0.0);
-    float primaryDepth = 1.0;
-    vec3 primaryAlbedo = vec3(0.0);
-    bool primaryHitRecorded = false;
+    // ========================================================================
+    // Primary Pass: ジッターなしで補助バッファを計算（SPPに依存しない）
+    // ========================================================================
+    vec2 uv0 = (vec2(pixel) + 0.5) / vec2(size) - 0.5;
+    vec3 primaryRay = normalize(uv0.x * right - uv0.y * up + screen_depth * forward);
+    PrimaryHitResult primary = tracePrimaryRay(camOrigin, primaryRay);
 
-    // SPPループで色を積算
+    // ========================================================================
+    // Color Pass: SPPループでジッター付きサンプリング
+    // ========================================================================
     vec3 accumulatedColor = vec3(0.0);
 
     for (int s = 0; s < spp; s++) {
@@ -234,162 +495,22 @@ void main() {
         // サブピクセルジッター
         vec2 jitter = vec2(rand(rng), rand(rng)) - 0.5;
         vec2 uv = (vec2(pixel) + 0.5 + jitter) / vec2(size) - 0.5;
-        vec3 initialRay = normalize(uv.x * right - uv.y * up + screen_depth * forward);
+        vec3 sampleRay = normalize(uv.x * right - uv.y * up + screen_depth * forward);
 
-        // スタック初期化
-        RayTask stack[MAX_STACK];
-        int stackPtr = 0;
-        vec3 sampleColor = vec3(0.0);
-
-        stack[stackPtr].origin = camOrigin;
-        stack[stackPtr].direction = initialRay;
-        stack[stackPtr].weight = 1.0;
-        stack[stackPtr].depth = 0;
-        stack[stackPtr].inside = false;
-        stackPtr++;
-
-        bool isFirstHit = true;
-
-        // メインループ
-        while (stackPtr > 0) {
-            stackPtr--;
-            RayTask task = stack[stackPtr];
-
-            if (task.depth > MAX_DEPTH) continue;
-            if (task.weight < 0.01) continue;
-
-            vec3 pos = task.origin;
-            vec3 ray = task.direction;
-            float distance = 0.0;
-            bool hit = false;
-
-            // レイマーチング
-            for (int i = 0; i < MAX_MARCH_STEPS; i++) {
-                if (distance > MAX_DISTANCE) break;
-                if (sphereCount == 0) break;
-
-                float kMax;
-                float weightSum;
-                float weights[MAX_SPHERES];
-                fieldAt(pos, kMax, weightSum, weights);
-                weightSum = max(weightSum, 1.0e-6);
-                float minDist = -log(weightSum) / max(kMax, 1.0e-6);
-
-                if (minDist < HIT_THRESHOLD) {
-                    // マテリアル情報を集約
-                    vec4 ratios = vec4(0.0);
-                    vec3 color = vec3(0.0);
-                    float ior = 0.0;
-                    for (int j = 0; j < sphereCount; j++) {
-                        Sphere sphere = spheres[j];
-                        ratios += sphere.ratios * weights[j];
-                        color += sphere.color * weights[j];
-                        ior += sphere.ior * weights[j];
-                    }
-                    ratios /= weightSum;
-                    color /= weightSum;
-                    ior /= weightSum;
-
-                    vec3 normal = calcNormal(pos);
-                    if (task.inside) normal = -normal;
-
-                    // プライマリヒット情報を記録（最初のサンプルの最初のヒットのみ）
-                    if (s == 0 && isFirstHit && task.depth == 0 && !primaryHitRecorded) {
-                        primaryNormal = normal * 0.5 + 0.5; // [-1,1] -> [0,1]
-                        primaryDepth = clamp(distance / 5.0, 0.0, 1.0); // 正規化
-                        primaryAlbedo = color;
-                        primaryHitRecorded = true;
-                    }
-                    isFirstHit = false;
-
-                    vec3 lightDir = -light.xyz;
-                    float shadow = calcSoftShadow(pos, lightDir, rng);
-
-                    // 環境光
-                    sampleColor += task.weight * ratios.x * color * light.w;
-
-                    // 拡散光
-                    float diff = max(dot(normal, lightDir), 0.0);
-                    sampleColor += task.weight * ratios.y * color * diff * light.w * shadow;
-
-                    // 反射
-                    if (ratios.z > 0.01 && stackPtr < MAX_STACK) {
-                        vec3 reflectDir = reflect(ray, normal);
-                        stack[stackPtr].origin = pos + normal * 0.01;
-                        stack[stackPtr].direction = reflectDir;
-                        stack[stackPtr].weight = task.weight * ratios.z;
-                        stack[stackPtr].depth = task.depth + 1;
-                        stack[stackPtr].inside = false;
-                        stackPtr++;
-                    }
-
-                    // 屈折
-                    if (ratios.w > 0.01 && stackPtr < MAX_STACK) {
-                        float eta = task.inside ? ior : (1.0 / ior);
-                        vec3 refractDir = refract(ray, normal, eta);
-                        if (length(refractDir) > 0.0) {
-                            stack[stackPtr].origin = pos - normal * 0.01;
-                            stack[stackPtr].direction = refractDir;
-                            stack[stackPtr].weight = task.weight * ratios.w;
-                            stack[stackPtr].depth = task.depth + 1;
-                            stack[stackPtr].inside = !task.inside;
-                            stackPtr++;
-                        }
-                    }
-
-                    hit = true;
-                    break;
-                }
-
-                distance += minDist;
-                pos += ray * minDist;
-            }
-
-            // ヒットしなかった場合
-            if (!hit) {
-                float t;
-                vec3 groundColor;
-                if (hitGround(task.origin, ray, t, groundColor)) {
-                    vec3 groundPos = task.origin + ray * t;
-                    vec3 groundNormal = vec3(0.0, 1.0, 0.0);
-                    vec3 lightDir = -light.xyz;
-                    float shadow = calcSoftShadow(groundPos, lightDir, rng);
-                    float diff = max(dot(groundNormal, lightDir), 0.0);
-                    sampleColor += task.weight * groundColor * (0.3 + 0.7 * diff * shadow);
-
-                    // プライマリヒット（地面）
-                    if (s == 0 && task.depth == 0 && !primaryHitRecorded) {
-                        primaryNormal = groundNormal * 0.5 + 0.5;
-                        primaryDepth = clamp(t / 5.0, 0.0, 1.0);
-                        primaryAlbedo = groundColor;
-                        primaryHitRecorded = true;
-                    }
-                } else {
-                    sampleColor += task.weight * proceduralBg(ray, rng);
-
-                    // プライマリ背景
-                    if (s == 0 && task.depth == 0 && !primaryHitRecorded) {
-                        primaryNormal = vec3(0.5, 0.5, 1.0); // 背景向き
-                        primaryDepth = 1.0;
-                        primaryAlbedo = proceduralBg(ray, rng);
-                        primaryHitRecorded = true;
-                    }
-                }
-            }
-        }
-
-        accumulatedColor += sampleColor;
+        accumulatedColor += traceColorSample(camOrigin, sampleRay, pixel, rng);
     }
 
     // 平均化
     vec3 finalColor = accumulatedColor / float(spp);
     finalColor = clamp(finalColor, 0.0, 1.0);
 
+    // ========================================================================
     // 出力
+    // ========================================================================
     imageStore(img_color, pixel, vec4(finalColor, 1.0));
-    imageStore(img_normal, pixel, vec4(primaryNormal, 1.0));
-    imageStore(img_depth, pixel, vec4(vec3(primaryDepth), 1.0));
-    imageStore(img_albedo, pixel, vec4(primaryAlbedo, 1.0));
+    imageStore(img_normal, pixel, vec4(primary.normal, 1.0));
+    imageStore(img_depth, pixel, vec4(vec3(primary.depth), 1.0));
+    imageStore(img_albedo, pixel, vec4(primary.albedo, 1.0));
 }
 """
 
@@ -406,15 +527,18 @@ def create_texture_rgba16f(width: int, height: int) -> int:
 
 def read_texture_float32(tex: int, width: int, height: int) -> np.ndarray:
     """テクスチャからfloat32データを読み出し"""
+    glPixelStorei(GL_PACK_ALIGNMENT, 1)
     glBindTexture(GL_TEXTURE_2D, tex)
     data = glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_FLOAT)
-    return np.frombuffer(data, dtype=np.float32).reshape(height, width, 4)
+    return np.frombuffer(data, dtype=np.float32).reshape(height, width, 4).copy()
 
 
 def generate_random_spheres(rng: np.random.Generator, n: int = None) -> np.ndarray:
     """ランダムな球データを生成"""
     if n is None:
         n = rng.integers(2, 7)
+    # MAX_SPHERESを超えないようにclamp
+    n = min(n, 16)
 
     spheres = []
     for _ in range(n):
@@ -484,7 +608,9 @@ def render_scene(
     height: int,
     spp: int,
     frame_seed: int,
-    shadow_softness: float = 0.1
+    shadow_softness: float = 0.15,
+    depth_far: float = 5.0,
+    shininess: float = 64.0
 ):
     """シーンをレンダリング"""
     # SSBOにデータをアップロード
@@ -494,7 +620,7 @@ def render_scene(
     glUseProgram(program)
 
     # Uniform設定
-    glUniform1i(glGetUniformLocation(program, "sphereCount"), spheres.shape[0])
+    glUniform1i(glGetUniformLocation(program, "sphereCount"), min(spheres.shape[0], 16))
     glUniform4f(
         glGetUniformLocation(program, "light"),
         light_dir[0], light_dir[1], light_dir[2], light_intensity
@@ -502,6 +628,8 @@ def render_scene(
     glUniform1ui(glGetUniformLocation(program, "frameSeed"), frame_seed)
     glUniform1i(glGetUniformLocation(program, "spp"), spp)
     glUniform1f(glGetUniformLocation(program, "shadowSoftness"), shadow_softness)
+    glUniform1f(glGetUniformLocation(program, "depthFar"), depth_far)
+    glUniform1f(glGetUniformLocation(program, "shininess"), shininess)
 
     # 背景パラメータ
     glUniform1i(glGetUniformLocation(program, "bgType"), bg_params['type'])
@@ -515,21 +643,30 @@ def render_scene(
     )
     glUniform1f(glGetUniformLocation(program, "bgPhase"), bg_params['phase'])
 
-    # テクスチャをバインド
-    glBindImageTexture(0, textures['color'], 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA16F)
-    glBindImageTexture(1, textures['normal'], 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA16F)
-    glBindImageTexture(2, textures['depth'], 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA16F)
-    glBindImageTexture(3, textures['albedo'], 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA16F)
+    # テクスチャをバインド（WRITE_ONLY）
+    glBindImageTexture(0, textures['color'], 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F)
+    glBindImageTexture(1, textures['normal'], 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F)
+    glBindImageTexture(2, textures['depth'], 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F)
+    glBindImageTexture(3, textures['albedo'], 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F)
 
     # 実行
     glDispatchCompute((width + 15) // 16, (height + 15) // 16, 1)
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
 
 
-def save_preview_png(data: np.ndarray, path: str):
-    """float32データをPNGプレビューとして保存"""
-    # [0,1] -> [0,255]
-    img = (np.clip(data[:, :, :3], 0, 1) * 255).astype(np.uint8)
+def save_preview_png(data: np.ndarray, path: str, apply_gamma: bool = True):
+    """float32データをPNGプレビューとして保存
+
+    Args:
+        data: [0,1] linear float32 データ
+        path: 出力パス
+        apply_gamma: Trueならgamma補正(1/2.2)を適用
+    """
+    img = np.clip(data[:, :, :3], 0, 1)
+    if apply_gamma:
+        # gamma補正: linear -> sRGB
+        img = np.power(img, 1.0 / 2.2)
+    img = (img * 255).astype(np.uint8)
     # RGB -> BGR
     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
     cv2.imwrite(path, img)
@@ -544,7 +681,9 @@ def main():
     parser.add_argument('--low_spp', type=int, nargs='+', default=[1, 2, 4, 8], help='低SPPリスト')
     parser.add_argument('--high_spp', type=int, default=256, help='高SPP（Ground Truth）')
     parser.add_argument('--seed', type=int, default=42, help='乱数シード')
-    parser.add_argument('--shadow_softness', type=float, default=0.1, help='ソフトシャドウの柔らかさ')
+    parser.add_argument('--shadow_softness', type=float, default=0.15, help='ソフトシャドウの柔らかさ')
+    parser.add_argument('--depth_far', type=float, default=5.0, help='depth正規化の最大距離')
+    parser.add_argument('--shininess', type=float, default=64.0, help='スペキュラの鋭さ')
     args = parser.parse_args()
 
     # 出力ディレクトリ作成
@@ -614,7 +753,8 @@ def main():
             program, textures, spheres, ssbo,
             light_dir, light_intensity, bg_params,
             args.width, args.height,
-            args.high_spp, frame_seed, args.shadow_softness
+            args.high_spp, frame_seed,
+            args.shadow_softness, args.depth_far, args.shininess
         )
 
         # 読み出し・保存
@@ -623,11 +763,14 @@ def main():
         depth = read_texture_float32(textures['depth'], args.width, args.height)
         albedo = read_texture_float32(textures['albedo'], args.width, args.height)
 
+        # NPYはlinearのまま保存
         np.save(os.path.join(scene_dir, "color_high.npy"), color_high)
         np.save(os.path.join(scene_dir, "normal.npy"), normal)
         np.save(os.path.join(scene_dir, "depth.npy"), depth)
         np.save(os.path.join(scene_dir, "albedo.npy"), albedo)
-        save_preview_png(color_high, os.path.join(scene_dir, "preview_high.png"))
+
+        # PNGはgamma補正して保存（見やすさのため）
+        save_preview_png(color_high, os.path.join(scene_dir, "preview_high.png"), apply_gamma=True)
 
         # 低SPPレンダリング
         for low_spp in args.low_spp:
@@ -635,12 +778,13 @@ def main():
                 program, textures, spheres, ssbo,
                 light_dir, light_intensity, bg_params,
                 args.width, args.height,
-                low_spp, frame_seed, args.shadow_softness
+                low_spp, frame_seed,
+                args.shadow_softness, args.depth_far, args.shininess
             )
 
             color_low = read_texture_float32(textures['color'], args.width, args.height)
             np.save(os.path.join(scene_dir, f"color_low_spp{low_spp}.npy"), color_low)
-            save_preview_png(color_low, os.path.join(scene_dir, f"preview_low_spp{low_spp}.png"))
+            save_preview_png(color_low, os.path.join(scene_dir, f"preview_low_spp{low_spp}.png"), apply_gamma=True)
 
         if (scene_idx + 1) % 10 == 0 or scene_idx == 0:
             print(f"進捗: {scene_idx + 1}/{args.n} シーン完了")
